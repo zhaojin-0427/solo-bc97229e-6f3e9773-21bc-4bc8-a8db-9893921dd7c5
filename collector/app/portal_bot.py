@@ -71,8 +71,16 @@ class PortalBot:
                 self._browser.close()
         except Exception:
             pass
-        if self._pw is not None:
-            self._pw.stop()
+        # 驱动进程也必须释放：泄漏的 asyncio 循环会污染 worker 线程，
+        # 导致后续任务全部报「Sync API inside the asyncio loop」。
+        try:
+            if self._pw is not None:
+                self._pw.stop()
+        except Exception:
+            pass
+        self._context = None
+        self._browser = None
+        self._pw = None
 
     # ---- 门户步骤 -------------------------------------------------------
     def _is_login_page(self) -> bool:
@@ -155,9 +163,13 @@ class PortalBot:
 
     # ---- 入口 -----------------------------------------------------------
     def run(self) -> Path:
-        """执行完整流程，返回下载文件路径。任何一步取消都会抛 TaskCancelled。"""
-        self._start()
+        """执行完整流程，返回下载文件路径。任何一步取消都会抛 TaskCancelled。
+
+        _start 也在 try 内：浏览器连接失败同样要释放已占用的驱动资源，
+        否则泄漏的 Playwright 循环会让本线程后续任务全部失败。
+        """
         try:
+            self._start()
             self._ensure_session()
             self._apply_filter()
             path = self._export_and_save()

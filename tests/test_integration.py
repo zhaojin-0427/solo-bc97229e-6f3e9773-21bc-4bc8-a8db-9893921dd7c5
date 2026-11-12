@@ -73,6 +73,12 @@ class IntegrationTest(unittest.TestCase):
         collector_config.DB_PATH = collector_config.DATA_DIR / "collector.db"
         collector_config.PUBLISHED_DIR = collector_config.DATA_DIR / "published"
         collector_config.WORK_DIR = collector_config.DATA_DIR / "work"
+        # 其他测试模块可能已先导入 config（环境变量不再生效），
+        # 这里显式覆盖本用例依赖的全部配置，保证与导入顺序无关。
+        collector_config.PORTAL_URL = f"http://127.0.0.1:{PORTAL_PORT}"
+        collector_config.BROWSER_CDP_URL = ""  # 本地自行 launch
+        collector_config.HEADLESS = True
+        collector_config.OPERATION_TIMEOUT_MS = 60000
 
         # 确认浏览器真能启动，缺系统库时跳过而不是误报失败
         try:

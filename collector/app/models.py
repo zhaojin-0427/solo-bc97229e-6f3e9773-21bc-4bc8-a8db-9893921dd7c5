@@ -3,7 +3,8 @@
 任务状态机：
     queued -> running -> published（成功发布）
                          -> failed（可重试）
-              queued/running -> cancelled（可重试）
+    queued/running -> cancelling -> cancelled（可重试；排队中取消直达 cancelled）
+取消与发布互斥：所有迁移都是带前置状态的条件更新，谁先落库谁生效。
 重试会新建一条任务（retry_of 指向上一条），保证历史可追溯。
 """
 from __future__ import annotations
@@ -112,47 +113,87 @@ class TaskStore:
             ).fetchone()
             return dict(row) if row else None
 
-    def update(self, task_id: str, **fields: Any) -> None:
-        if not fields:
-            return
+    # ---- 状态迁移（全部带前置条件，状态列是唯一裁决点） -------------------
+    #
+    # 取消与发布互斥的关键：每次迁移都是一条「WHERE status = <前置状态>」的
+    # 条件更新，在同一把锁内与 request_cancel 串行化。谁先改写状态谁生效，
+    # 后到者的条件更新影响 0 行而失败，绝不可能出现取消受理后又被发布覆盖。
+    def _transition(self, task_id: str, from_states: tuple[str, ...],
+                    **fields: Any) -> bool:
+        """仅当当前状态属于 from_states 时应用字段更新，返回是否生效。"""
         columns = ", ".join(f"{k} = ?" for k in fields)
+        placeholders = ", ".join("?" for _ in from_states)
         with self._lock:
-            self._conn.execute(
-                f"UPDATE tasks SET {columns} WHERE id = ?",
-                (*fields.values(), task_id),
+            cur = self._conn.execute(
+                f"UPDATE tasks SET {columns} WHERE id = ?"
+                f" AND status IN ({placeholders})",
+                (*fields.values(), task_id, *from_states),
             )
             self._conn.commit()
+            return cur.rowcount == 1
 
-    def mark_running(self, task_id: str) -> None:
-        self.update(task_id, status="running", started_at=_now(),
-                    message="浏览器已接管门户会话，开始筛选")
+    def try_mark_running(self, task_id: str) -> bool:
+        """仅当仍为 queued 时置为 running；排队中已被取消则返回 False。"""
+        return self._transition(
+            task_id, ("queued",), status="running", started_at=_now(),
+            message="浏览器已接管门户会话，开始筛选",
+        )
 
-    def mark_published(self, task_id: str, file_name: str) -> None:
-        self.update(task_id, status="published", finished_at=_now(),
-                    published_file=file_name, message="校验通过，已发布到质量库")
+    def try_mark_published(self, task_id: str, file_name: str) -> bool:
+        """发布裁决点：仅当仍为 running 时生效。
 
-    def mark_failed(self, task_id: str, message: str) -> None:
-        self.update(task_id, status="failed", finished_at=_now(), message=message)
+        取消先受理（cancelling/cancelled）时返回 False，调用方必须撤回
+        已复制的质量库文件并完成取消清理。
+        """
+        return self._transition(
+            task_id, ("running",), status="published", finished_at=_now(),
+            published_file=file_name, message="校验通过，已发布到质量库",
+        )
 
-    def mark_cancelled(self, task_id: str, message: str = "任务已取消") -> None:
-        self.update(task_id, status="cancelled", finished_at=_now(), message=message)
+    def try_mark_failed(self, task_id: str, message: str) -> bool:
+        """仅当仍为 running 时置为 failed；取消先受理则返回 False。"""
+        return self._transition(
+            task_id, ("running",), status="failed", finished_at=_now(),
+            message=message,
+        )
+
+    def finalize_cancelled(self, task_id: str,
+                           message: str = "任务已取消") -> None:
+        """取消收尾：仅从未终态推进到 cancelled，绝不覆盖 published/failed。"""
+        self._transition(task_id, tuple(ACTIVE_STATES), status="cancelled",
+                         finished_at=_now(), message=message)
+        self._cancel_events.pop(task_id, None)
 
     def request_cancel(self, task_id: str) -> tuple[bool, str]:
-        """请求取消。返回 (是否成功, 说明)。"""
+        """请求取消。返回 (是否受理, 说明)。
+
+        与发布互斥：已发布则拒绝并保留文件；受理后任务最终必然进入
+        cancelled，后续成功或异常都不得改写。
+        """
         with self._lock:
             task = self.get_task(task_id)
             if task is None:
                 return False, "任务不存在"
-            if task["status"] in FINAL_STATES:
-                return False, f"任务已处于终态 {task['status']}，无法取消"
+            status = task["status"]
+            if status == "published":
+                return False, "任务已发布，质量库文件保留，无法取消"
+            if status in FINAL_STATES:
+                return False, f"任务已处于终态 {status}，无法取消"
             self._event(task_id).set()
-            if task["status"] == "queued":
+            if status == "queued":
                 # 排队中：直接终结，不必等 worker。
-                self.update(task_id, status="cancelled", finished_at=_now(),
-                            message="排队中取消，未占用门户会话")
-            else:
-                self.update(task_id, status="cancelling",
-                            message="取消请求已下发，正在停止浏览器操作")
+                self._transition(
+                    task_id, ("queued",), status="cancelled",
+                    finished_at=_now(), message="排队中取消，未占用门户会话",
+                )
+                self._cancel_events.pop(task_id, None)
+                return True, "取消请求已受理"
+            if status == "running":
+                self._transition(
+                    task_id, ("running",), status="cancelling",
+                    message="取消请求已下发，正在停止浏览器操作",
+                )
+            # cancelling 下的重复取消视为幂等受理。
             return True, "取消请求已受理"
 
     def retry(self, task_id: str) -> dict[str, Any] | None:

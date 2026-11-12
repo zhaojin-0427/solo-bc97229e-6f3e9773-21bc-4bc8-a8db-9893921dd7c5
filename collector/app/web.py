@@ -25,14 +25,16 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 LINE_RE = re.compile(r"^[一-龥A-Za-z0-9_-]{1,20}$")
 
 
-def create_app() -> Flask:
+def create_app(store: TaskStore | None = None,
+               worker: Worker | None = None) -> Flask:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     app = Flask(__name__)
-    store = TaskStore()
-    worker = Worker(store)
+    # 默认自建存储与 worker；测试可注入假 bot 的 worker 复现竞态时序。
+    store = store or TaskStore()
+    worker = worker or Worker(store)
 
     # 上次进程遗留的未完成任务统一转为可重试失败态。
     recovered = store.recover_stale()
